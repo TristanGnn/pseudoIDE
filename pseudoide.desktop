@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=PseudoIDE
+Comment=IDE pour le pseudocode du cours de méthodes de programmation
+Exec=/home/mint/hers/methode/ide/pseudo-ide
+Icon=/home/mint/hers/methode/ide/icone.svg
+Terminal=true
+Categories=Development;

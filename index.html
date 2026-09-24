@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PseudoIDE</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Inter:wght@400;500;600&display=swap">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="app">
+  <header class="toolbar">
+    <div class="brand"><span class="logo">Ψ</span> PseudoIDE</div>
+
+    <div class="group">
+      <button id="btn-new" title="Nouveau fichier (Alt+N)">＋ Nouveau</button>
+      <button id="btn-open" title="Ouvrir un fichier (Ctrl+O)">Ouvrir</button>
+      <button id="btn-save" title="Enregistrer (Ctrl+S)">Enregistrer</button>
+      <div class="menu">
+        <button id="btn-insert" title="Insérer une structure">Insérer ▾</button>
+        <div class="menu-list" id="menu-insert"></div>
+      </div>
+      <button id="btn-format" title="Réindenter le code (Ctrl+Shift+F)">Indenter</button>
+    </div>
+
+    <div class="group run">
+      <button id="btn-run" class="primary" title="Exécuter / Continuer (F5)">▶ Exécuter</button>
+      <button id="btn-step" title="Pas à pas : une instruction (F10)">⤼ Pas à pas</button>
+      <button id="btn-stop" title="Arrêter (Maj+F5)" disabled>■ Arrêter</button>
+      <label class="speed" title="Vitesse d'exécution">
+        <select id="speed">
+          <option value="0">Instantané</option>
+          <option value="80">Rapide</option>
+          <option value="400">Lent</option>
+          <option value="1000">Très lent</option>
+        </select>
+      </label>
+    </div>
+
+    <div class="group right">
+      <button id="btn-theme" title="Thème clair / sombre">◐</button>
+    </div>
+  </header>
+
+  <main id="main">
+    <aside id="sidebar">
+      <div class="side-head">
+        <span id="root-name">Fichiers</span>
+        <span class="side-actions">
+          <button id="btn-refresh" class="icon" title="Rafraîchir">⟳</button>
+        </span>
+      </div>
+      <div id="tree"></div>
+    </aside>
+    <div class="splitter v" data-split="sidebar"></div>
+
+    <section id="center">
+      <div id="tabs"></div>
+      <div id="editor" class="editor">
+        <div class="gutter"><div class="gutter-inner" id="gutter"></div></div>
+        <div class="code">
+          <div class="hl"><div class="hl-inner" id="hl"></div></div>
+          <textarea id="src" spellcheck="false" autocapitalize="off" autocomplete="off" autocorrect="off" wrap="off"></textarea>
+        </div>
+        <div id="tooltip" class="tooltip" hidden></div>
+      </div>
+
+      <div class="splitter h" data-split="bottom"></div>
+      <div id="bottom">
+        <div class="panel-tabs">
+          <button class="ptab active" data-panel="console">Console</button>
+          <button class="ptab" data-panel="problems">Problèmes <span id="prob-count" class="badge"></span></button>
+          <button class="ptab" data-panel="trace">Traçage</button>
+          <span class="spacer"></span>
+          <button id="btn-clear" class="icon" title="Effacer la console">⌫</button>
+        </div>
+        <div class="panel active" id="panel-console">
+          <div id="console"></div>
+          <form id="input-row" hidden>
+            <span id="input-label"></span>
+            <input id="input" autocomplete="off" spellcheck="false">
+          </form>
+        </div>
+        <div class="panel" id="panel-problems"><div id="problems"></div></div>
+        <div class="panel" id="panel-trace"><div id="trace"></div></div>
+      </div>
+    </section>
+
+    <div class="splitter v" data-split="right"></div>
+    <aside id="right">
+      <div class="panel-tabs">
+        <button class="rtab active" data-panel="memory">Mémoire</button>
+        <button class="rtab" data-panel="help">Aide syntaxe</button>
+      </div>
+      <div class="rpanel active" id="rpanel-memory">
+        <table class="memory">
+          <thead><tr><th>Adresse</th><th>Nom</th><th>Type</th><th>Valeur</th></tr></thead>
+          <tbody id="memory"></tbody>
+        </table>
+        <p class="hint" id="memory-hint">Les variables apparaissent ici pendant l'exécution.<br>« ? » = pas encore initialisée.</p>
+      </div>
+      <div class="rpanel" id="rpanel-help"></div>
+    </aside>
+  </main>
+
+  <footer class="status">
+    <span id="st-state" class="state idle">Prêt</span>
+    <span id="st-diag"></span>
+    <span class="spacer"></span>
+    <span id="st-file"></span>
+    <span id="st-pos">Ln 1, Col 1</span>
+  </footer>
+</div>
+
+<input type="file" id="file-input" accept=".txt,.algo,.pseudo,.psc,text/plain" hidden multiple>
+<script src="interpreteur.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

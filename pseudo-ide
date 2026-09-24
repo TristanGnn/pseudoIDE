@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Lance PseudoIDE (serveur local + navigateur).
+# Usage : pseudo-ide [--racine DOSSIER] [--port N]
+exec python3 "$(dirname "$(readlink -f "$0")")/serveur.py" "$@"
