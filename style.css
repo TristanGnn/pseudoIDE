@@ -157,6 +157,9 @@ select {
 .tree-item.active { background: var(--sel); }
 .tree-item .ic { width: 14px; text-align: center; color: var(--text-dim); flex: none; }
 .tree-item.dir { font-weight: 500; }
+.tree-item.dragging { opacity: .45; }
+.tree-item.drop-target { background: var(--sel); outline: 1px dashed var(--accent); }
+#tree.drop-root { outline: 1px dashed var(--accent); outline-offset: -3px; }
 .tree-children { padding-left: 12px; }
 .tree-children.closed { display: none; }
 .tree-msg { padding: 10px 12px; color: var(--text-dim); line-height: 1.5; }
@@ -361,3 +364,39 @@ table { border-collapse: collapse; width: 100%; }
   #main { grid-template-columns: 0 0 1fr 0 0; }
   #sidebar, #right { display: none; }
 }
+
+/* sélecteur de dossier de travail */
+.fp-overlay { position: fixed; inset: 0; background: rgba(0, 0, 0, .5); display: grid; place-items: center; z-index: 50; }
+.fp-box { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; width: min(460px, 92vw);
+  max-height: 80vh; display: flex; flex-direction: column; box-shadow: 0 12px 40px rgba(0, 0, 0, .45); }
+.fp-title { padding: 12px 14px 4px; font-weight: 600; }
+.fp-path { padding: 0 14px 8px; color: var(--text-dim); font-family: var(--font-code); font-size: 12px; word-break: break-all; }
+.fp-list { overflow: auto; padding: 4px 6px; border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); min-height: 140px; }
+.fp-item { padding: 6px 10px; border-radius: 4px; cursor: pointer; user-select: none; }
+.fp-item:hover { background: var(--bg-3); }
+.fp-empty { padding: 10px; color: var(--text-dim); }
+.fp-actions { display: flex; gap: 8px; justify-content: flex-end; padding: 10px 14px; }
+
+/* explorateur façon VS Code */
+#tree { outline: none; position: relative; }
+.tree-item.selected { background: var(--sel); }
+.tree-item.active:not(.selected) { background: var(--bg-3); }
+#tree:focus .tree-item.cursor { outline: 1px solid var(--accent); outline-offset: -1px; }
+.tree-item.cut { opacity: .5; }
+.tree-item .lbl { overflow: hidden; text-overflow: ellipsis; }
+.tree-input { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 2px 8px; margin: 0 4px; }
+.tree-input .ic { width: 14px; text-align: center; color: var(--text-dim); flex: none; }
+.tree-input input { flex: 1; min-width: 0; font: inherit; color: var(--text); background: var(--bg);
+  border: 1px solid var(--accent); border-radius: 3px; padding: 1px 4px; outline: none; }
+.tree-input input.bad { border-color: var(--danger); }
+.tree-err { flex-basis: 100%; margin-left: 20px; padding: 3px 6px; font-size: 12px; color: #fff; background: var(--danger); border-radius: 0 0 3px 3px; }
+.side-actions { display: flex; gap: 0; }
+.side-actions button.icon { font-size: 13px; padding: 2px 4px; text-transform: none; }
+.ctx-menu { position: fixed; z-index: 60; min-width: 230px; padding: 4px; background: var(--panel);
+  border: 1px solid var(--border); border-radius: 8px; box-shadow: 0 8px 28px rgba(0, 0, 0, .45); font-size: 13px; }
+.ctx-item { display: flex; justify-content: space-between; gap: 24px; padding: 5px 12px; border-radius: 4px; cursor: pointer; user-select: none; }
+.ctx-item:hover:not(.disabled) { background: var(--accent-2); color: #fff; }
+.ctx-item.disabled { opacity: .4; cursor: default; }
+.ctx-key { color: var(--text-dim); }
+.ctx-item:hover:not(.disabled) .ctx-key { color: #dbe7ff; }
+.ctx-sep { height: 1px; margin: 4px 6px; background: var(--border); }

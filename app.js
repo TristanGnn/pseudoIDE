@@ -32,7 +32,7 @@
 
   // ================================================================ serveur
 
-  const server = { ok: false, rootName: 'Fichiers' };
+  const server = { ok: false, rootName: 'Fichiers', rootPath: '' };
 
   async function api(path, opts) {
     const r = await fetch(path, opts);
@@ -50,7 +50,24 @@
       const info = await (await api('/api/info')).json();
       server.ok = true;
       server.rootName = info.nom;
+      server.rootPath = info.racine;
+      // retrouve le dossier de travail choisi la dernière fois (le serveur l'oublie au redémarrage)
+      // ?dossier=hers/c dans l'URL (lien depuis le hub) : prioritaire sur le dernier dossier ouvert
+      const demande = new URLSearchParams(location.search).get('dossier');
+      const saved = demande != null ? demande : store.get('racine', null);
+      if (saved != null && saved !== info.courant) {
+        try { const r = await (await postJson('/api/racine', { chemin: saved })).json(); server.rootName = r.nom; server.rootPath = r.racine; }
+        catch (e) { store.set('racine', info.courant); }
+      } else store.set('racine', info.courant);
     } catch (e) { server.ok = false; }
+  }
+
+  function postJson(path, body) {
+    return api(path, {
+      method: 'POST',
+      headers: { 'X-Pseudo-IDE': '1', 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
   }
 
   // ================================================================ documents / onglets
@@ -157,7 +174,8 @@
     renderTabs();
     analyseNow();
     saveSessionSoon();
-    ta.focus();
+    if (!keepTreeFocus) ta.focus();
+    revealActive(d);
   }
 
   function closeDoc(d) {
@@ -215,7 +233,8 @@
     }
     let path = d.path;
     if (!path || askPath) {
-      path = prompt('Enregistrer sous (chemin dans « ' + server.rootName + ' ») :', d.path || d.name);
+      const dir = targetDir();
+      path = prompt('Enregistrer sous (chemin dans « ' + server.rootName + ' ») :', d.path || (dir ? dir + '/' : '') + d.name);
       if (!path) return;
       path = path.trim().replace(/^\/+/, '');
       if (!/\.[a-z]+$/i.test(path)) path += '.txt';
@@ -228,89 +247,137 @@
       const isNew = d.path !== r.chemin;
       d.path = r.chemin; d.name = r.chemin.split('/').pop(); d.saved = d.content;
       renderTabs(); saveSessionSoon();
-      if (isNew) loadTree();
+      if (isNew || !itemOf(r.chemin)) loadTree().then(() => revealActive(d));
       consoleSys('✔ Enregistré : ' + server.rootName + '/' + d.path);
     } catch (e) {
       alert('Échec de l\'enregistrement : ' + e.message);
     }
   }
 
-  async function createFile() {
-    if (!server.ok) {
-      const d = newDoc({ name: 'sans_titre.txt', content: TEMPLATE, saved: null });
-      switchTo(d);
-      return;
-    }
-    let path = prompt('Nom du nouveau fichier (tu peux mettre un sous-dossier, ex : labo/ex4.txt) :', 'nouveau.txt');
-    if (!path) return;
-    path = path.trim().replace(/^\/+/, '');
-    if (!/\.[a-z]+$/i.test(path)) path += '.txt';
-    try {
-      const exists = await fetch('/api/fichier?chemin=' + encodeURIComponent(path));
-      if (exists.ok && !confirm('« ' + path + ' » existe déjà. L\'ouvrir ?')) return;
-      if (exists.ok) { openPath(path); return; }
-    } catch (e) { /* on crée */ }
-    const d = newDoc({ name: path.split('/').pop(), path, content: TEMPLATE, saved: null });
-    switchTo(d);
-    const caret = TEMPLATE.indexOf('DEBUT') + 10;
-    ta.setSelectionRange(caret, caret);
-    await saveDoc(d);
+  /** « Nouveau » de la barre du haut : un fichier sans titre, enregistré (et placé dans l'arbre) au premier Ctrl+S. */
+  function createFile() {
+    switchTo(newDoc({ name: 'sans_titre.txt', content: TEMPLATE, saved: null }));
   }
 
-  // ================================================================ explorateur
+  // ================================================================ explorateur (copie de l'Explorateur de VS Code)
+  //
+  // Clic = sélectionner (fichier : l'ouvrir, dossier : le plier/déplier) · Ctrl+clic / Maj+clic = sélection multiple
+  // Clic droit = menu · F2 renommer · Suppr supprimer (corbeille) · Ctrl+C/X/V copier/couper/coller
+  // Glisser-déposer = déplacer (Ctrl enfoncé = copier) · flèches/Entrée = navigation au clavier
+  // Nouveau fichier / dossier = champ de saisie dans l'arbre, dans le dossier sélectionné
 
   const openDirs = new Set(store.get('openDirs', null) || []);
-  let firstTree = store.get('openDirs', null) == null;
+  const treeEl = $('#tree');
+  const sel = new Set();              // chemins sélectionnés
+  let anchor = null;                  // point de départ des sélections Maj+clic
+  let cursor = '';                    // élément courant ('' = aucun)
+  let clip = { paths: [], cut: false };
+  let keepTreeFocus = false;          // un clic dans l'arbre ouvre le fichier sans lui prendre le focus (comme VS Code)
+  let firstReveal = true;
+  let inputState = null;              // champ de saisie en cours (création / renommage)
+
+  const dirOf = (p) => p.includes('/') ? p.slice(0, p.lastIndexOf('/')) : '';
+  const baseName = (p) => p.slice(p.lastIndexOf('/') + 1);
+  const allItems = () => Array.from(treeEl.querySelectorAll('.tree-item[data-path]'));
+  const itemOf = (path) => allItems().find(el => el.dataset.path === path) || null;
+  const visibleItems = () => allItems().filter(el => !el.parentElement.closest('.tree-children.closed'));
+  const isDirItem = (el) => !!el && el.dataset.type === 'dossier';
+
+  function paint() {
+    for (const el of allItems()) {
+      const p = el.dataset.path;
+      el.classList.toggle('selected', sel.has(p));
+      el.classList.toggle('cursor', p === cursor);
+      el.classList.toggle('cut', clip.cut && clip.paths.includes(p));
+    }
+  }
+
+  function select(paths, cur) {
+    sel.clear();
+    paths.forEach(p => sel.add(p));
+    cursor = cur !== undefined ? cur : (paths.length ? paths[paths.length - 1] : '');
+    paint();
+  }
+
+  function selectRange(toPath) {
+    const vis = visibleItems().map(el => el.dataset.path);
+    const a = vis.indexOf(anchor != null ? anchor : cursor), b = vis.indexOf(toPath);
+    if (b < 0) return;
+    const [i, j] = a < 0 ? [b, b] : [Math.min(a, b), Math.max(a, b)];
+    select(vis.slice(i, j + 1), toPath);
+  }
+
+  /** Dossier où « nouveau » et « coller » agissent : le dossier sélectionné, ou le dossier du fichier sélectionné. */
+  function targetDir() {
+    if (!cursor) return '';
+    const el = itemOf(cursor);
+    if (!el) return '';
+    return isDirItem(el) ? cursor : dirOf(cursor);
+  }
+
+  function setOpen(path, open) {
+    if (open) openDirs.add(path); else openDirs.delete(path);
+    store.set('openDirs', [...openDirs]);
+    const el = itemOf(path);
+    if (!el || !isDirItem(el)) return;
+    el.querySelector('.ic').textContent = open ? '▾' : '▸';
+    el.nextElementSibling.classList.toggle('closed', !open);
+  }
+
+  function openAncestors(path) { for (let d = dirOf(path); d; d = dirOf(d)) setOpen(d, true); }
+
+  // ---------------------------------------------------------------- affichage
 
   async function loadTree() {
-    const el = $('#tree');
     $('#root-name').textContent = server.ok ? server.rootName : 'Fichiers';
     if (!server.ok) {
-      el.innerHTML = '<div class="tree-msg">Mode sans serveur : les fichiers sont ouverts depuis le disque et enregistrés par téléchargement.<br><br>' +
-        'Pour ouvrir/enregistrer directement tes fichiers, lance :<br><code>~/hers/methode/ide/pseudo-ide</code>' +
+      treeEl.innerHTML = '<div class="tree-msg">Mode sans serveur : les fichiers sont ouverts depuis le disque et enregistrés par téléchargement.<br><br>' +
+        'Pour ouvrir/enregistrer directement tes fichiers, lance :<br><code>python3 serveur.py</code>' +
         '<br><button id="tree-open">Ouvrir un fichier…</button></div>';
       $('#tree-open').onclick = () => $('#file-input').click();
       return;
     }
     try {
       const tree = await (await api('/api/arbre')).json();
-      el.innerHTML = '';
-      if (!tree.length) el.innerHTML = '<div class="tree-msg">Aucun fichier .txt ici. Crée-en un avec « ＋ Nouveau ».</div>';
-      el.appendChild(renderTree(tree));
-      if (firstTree) { firstTree = false; store.set('openDirs', [...openDirs]); }
+      inputState = null;
+      treeEl.innerHTML = '';
+      if (!tree.length) treeEl.innerHTML = '<div class="tree-msg">Dossier vide. Crée un fichier avec 📄＋ ou un clic droit.</div>';
+      treeEl.appendChild(renderTree(tree));
+      for (const p of [...sel]) if (!itemOf(p)) sel.delete(p);
+      if (cursor && !itemOf(cursor)) cursor = '';
       highlightTreeActive();
+      paint();
+      if (firstReveal) { firstReveal = false; const a = active(); if (a) revealActive(a); }
     } catch (e) {
-      el.innerHTML = '<div class="tree-msg">Erreur : ' + esc(e.message) + '</div>';
+      treeEl.innerHTML = '<div class="tree-msg">Erreur : ' + esc(e.message) + '</div>';
     }
   }
 
   function renderTree(nodes) {
     const frag = document.createDocumentFragment();
     for (const n of nodes) {
+      const isDir = n.type === 'dossier';
       const item = document.createElement('div');
-      item.className = 'tree-item ' + (n.type === 'dossier' ? 'dir' : 'file');
+      item.className = 'tree-item ' + (isDir ? 'dir' : 'file');
       item.dataset.path = n.chemin;
-      if (n.type === 'dossier') {
-        if (firstTree) openDirs.add(n.chemin);
+      item.dataset.type = n.type;
+      item.draggable = true;
+      const ic = document.createElement('span');
+      ic.className = 'ic';
+      const label = document.createElement('span');
+      label.className = 'lbl';
+      label.textContent = n.nom;
+      item.append(ic, label);
+      if (isDir) {
         const open = openDirs.has(n.chemin);
-        item.innerHTML = '<span class="ic">' + (open ? '▾' : '▸') + '</span><span></span>';
-        item.lastChild.textContent = n.nom;
+        ic.textContent = open ? '▾' : '▸';
         const kids = document.createElement('div');
         kids.className = 'tree-children' + (open ? '' : ' closed');
         kids.appendChild(renderTree(n.enfants));
-        item.onclick = () => {
-          const now = kids.classList.toggle('closed');
-          item.firstChild.textContent = now ? '▸' : '▾';
-          if (now) openDirs.delete(n.chemin); else openDirs.add(n.chemin);
-          store.set('openDirs', [...openDirs]);
-        };
-        frag.appendChild(item);
-        frag.appendChild(kids);
+        frag.append(item, kids);
       } else {
-        item.innerHTML = '<span class="ic">≡</span><span></span>';
-        item.lastChild.textContent = n.nom;
-        item.onclick = () => openPath(n.chemin);
-        frag.appendChild(item);
+        ic.textContent = '≡';
+        frag.append(item);
       }
     }
     return frag;
@@ -318,7 +385,471 @@
 
   function highlightTreeActive() {
     const a = active();
-    $$('#tree .tree-item.file').forEach(el => el.classList.toggle('active', !!a && el.dataset.path === a.path));
+    allItems().forEach(el => el.classList.toggle('active', !!a && el.dataset.type === 'fichier' && el.dataset.path === a.path));
+  }
+
+  /** « Auto Reveal » de VS Code : l'onglet actif est déplié et sélectionné dans l'arbre. */
+  function revealActive(d) {
+    if (!server.ok || !d || !d.path) return;
+    const el = itemOf(d.path);
+    if (!el) return;
+    openAncestors(d.path);
+    if (!(sel.size === 1 && sel.has(d.path))) { select([d.path]); anchor = d.path; }
+    el.scrollIntoView({ block: 'nearest' });
+  }
+
+  // ---------------------------------------------------------------- souris
+
+  async function openFromTree(p) {
+    keepTreeFocus = true;
+    try { await openPath(p); } finally { keepTreeFocus = false; }
+  }
+
+  treeEl.tabIndex = 0;
+
+  treeEl.addEventListener('click', (e) => {
+    if (e.target.closest('.tree-input')) return;
+    treeEl.focus({ preventScroll: true });
+    const el = e.target.closest('.tree-item');
+    if (!el) { select([]); anchor = null; return; }
+    const p = el.dataset.path;
+    if (e.ctrlKey || e.metaKey) {
+      if (sel.has(p)) sel.delete(p); else sel.add(p);
+      cursor = p; anchor = p; paint();
+    } else if (e.shiftKey) {
+      selectRange(p);
+    } else {
+      select([p]); anchor = p;
+      if (isDirItem(el)) setOpen(p, !openDirs.has(p)); else openFromTree(p);
+    }
+  });
+
+  treeEl.addEventListener('dblclick', (e) => {
+    const el = e.target.closest('.tree-item');
+    if (el && !isDirItem(el)) ta.focus();
+  });
+
+  treeEl.addEventListener('contextmenu', (e) => {
+    e.preventDefault();
+    if (e.target.closest('.tree-input')) return;
+    const el = e.target.closest('.tree-item');
+    if (!el) { select([]); anchor = null; }
+    else if (!sel.has(el.dataset.path)) { select([el.dataset.path]); anchor = el.dataset.path; }
+    else { cursor = el.dataset.path; paint(); }
+    treeEl.focus({ preventScroll: true });
+    showMenu(e.clientX, e.clientY);
+  });
+
+  // ---------------------------------------------------------------- menu contextuel
+
+  let menuEl = null;
+  function closeMenu() {
+    if (!menuEl) return;
+    menuEl.remove(); menuEl = null;
+    document.removeEventListener('mousedown', onMenuDown, true);
+    document.removeEventListener('keydown', onMenuKey, true);
+    window.removeEventListener('blur', closeMenu);
+  }
+  function onMenuDown(e) { if (menuEl && !menuEl.contains(e.target)) closeMenu(); }
+  function onMenuKey(e) { if (e.key === 'Escape') { e.stopPropagation(); closeMenu(); } }
+
+  function showMenu(x, y) {
+    closeMenu();
+    const one = sel.size === 1, any = sel.size > 0;
+    const entries = [
+      ['Nouveau fichier…', '', () => startCreate('file')],
+      ['Nouveau dossier…', '', () => startCreate('dir')],
+      null,
+      ['Couper', 'Ctrl+X', cutSel, any],
+      ['Copier', 'Ctrl+C', copySel, any],
+      ['Coller', 'Ctrl+V', paste, clip.paths.length > 0],
+      null,
+      ['Copier le chemin', '', () => copyPath(false), one],
+      ['Copier le chemin relatif', '', () => copyPath(true), one],
+      null,
+      ['Renommer…', 'F2', startRename, one],
+      ['Supprimer', 'Suppr', deleteSel, any],
+      null,
+      ['Actualiser', '', loadTree],
+    ];
+    menuEl = document.createElement('div');
+    menuEl.className = 'ctx-menu';
+    for (const en of entries) {
+      if (!en) { const s = document.createElement('div'); s.className = 'ctx-sep'; menuEl.appendChild(s); continue; }
+      const [label, key, fn, enabled = true] = en;
+      const row = document.createElement('div');
+      row.className = 'ctx-item' + (enabled ? '' : ' disabled');
+      row.innerHTML = '<span></span><span class="ctx-key"></span>';
+      row.firstChild.textContent = label;
+      row.lastChild.textContent = key;
+      if (enabled) row.onclick = () => { closeMenu(); fn(); };
+      menuEl.appendChild(row);
+    }
+    document.body.appendChild(menuEl);
+    const r = menuEl.getBoundingClientRect();
+    menuEl.style.left = Math.max(4, Math.min(x, window.innerWidth - r.width - 4)) + 'px';
+    menuEl.style.top = Math.max(4, Math.min(y, window.innerHeight - r.height - 4)) + 'px';
+    document.addEventListener('mousedown', onMenuDown, true);
+    document.addEventListener('keydown', onMenuKey, true);
+    window.addEventListener('blur', closeMenu);
+  }
+
+  // ---------------------------------------------------------------- champ de saisie dans l'arbre (nouveau / renommer)
+
+  function cancelInput() {
+    if (!inputState) return;
+    const s = inputState;
+    inputState = null;
+    s.row.remove();
+    if (s.restore) s.restore();
+  }
+
+  function inputRow(icon, value, commit) {
+    const row = document.createElement('div');
+    row.className = 'tree-input';
+    row.innerHTML = '<span class="ic"></span><input type="text" spellcheck="false" autocomplete="off"><div class="tree-err" hidden></div>';
+    row.querySelector('.ic').textContent = icon;
+    const input = row.querySelector('input');
+    const err = row.querySelector('.tree-err');
+    input.value = value;
+    let busy = false;
+    const fail = (m) => { err.textContent = m; err.hidden = false; input.classList.add('bad'); };
+    input.addEventListener('input', () => { err.hidden = true; input.classList.remove('bad'); });
+    input.addEventListener('keydown', async (e) => {
+      e.stopPropagation();
+      if (e.key === 'Escape') { e.preventDefault(); cancelInput(); treeEl.focus(); return; }
+      if (e.key !== 'Enter') return;
+      e.preventDefault();
+      const name = input.value.trim();
+      if (!name) { cancelInput(); treeEl.focus(); return; }
+      if (/[\\/]/.test(name)) { fail('Le nom ne peut pas contenir / ou \\'); return; }
+      if (busy) return;
+      busy = true;
+      try { await commit(name); cancelInput(); treeEl.focus(); }
+      catch (er) { fail(er.message); busy = false; }
+    });
+    input.addEventListener('blur', () => {
+      setTimeout(() => { if (inputState && inputState.row === row && !busy) cancelInput(); }, 150);
+    });
+    inputState = { row, restore: null };
+    return row;
+  }
+
+  function startCreate(kind) {
+    if (!server.ok) { alert('Il faut lancer le serveur (serveur.py) pour créer des fichiers et des dossiers.'); return; }
+    cancelInput();
+    const dir = targetDir();
+    if (dir) { openAncestors(dir); setOpen(dir, true); }
+    const holder = dir ? itemOf(dir).nextElementSibling : treeEl;
+    const row = inputRow(kind === 'dir' ? '▸' : '≡', '', async (name) => {
+      let p = (dir ? dir + '/' : '') + name;
+      if (kind === 'dir') {
+        const r = await (await postJson('/api/dossier', { chemin: p })).json();
+        openDirs.add(r.chemin); store.set('openDirs', [...openDirs]);
+        await loadTree();
+        select([r.chemin]); anchor = r.chemin;
+      } else {
+        if (!/\.[a-z0-9]+$/i.test(name)) p += '.txt';
+        const exists = await fetch('/api/fichier?chemin=' + encodeURIComponent(p));
+        if (exists.ok) throw new Error('« ' + baseName(p) + ' » existe déjà');
+        await api('/api/fichier?chemin=' + encodeURIComponent(p), {
+          method: 'PUT', headers: { 'X-Pseudo-IDE': '1', 'Content-Type': 'text/plain; charset=utf-8' }, body: ''
+        });
+        await loadTree();
+        select([p]); anchor = p;
+        await openFromTree(p);
+      }
+    });
+    holder.insertBefore(row, holder.firstChild);
+    row.scrollIntoView({ block: 'nearest' });
+    row.querySelector('input').focus();
+  }
+
+  function startRename() {
+    if (sel.size !== 1) return;
+    const p = [...sel][0];
+    const el = itemOf(p);
+    if (!el) return;
+    cancelInput();
+    const old = baseName(p);
+    const row = inputRow(el.querySelector('.ic').textContent, old, async (name) => {
+      if (name === old) return;
+      const r = await (await postJson('/api/renommer', { chemin: p, nom: name })).json();
+      remap([[p, r.chemin]]);
+      await loadTree();
+      select([r.chemin]); anchor = r.chemin;
+    });
+    el.style.display = 'none';
+    inputState.restore = () => { el.style.display = ''; };
+    el.after(row);
+    const input = row.querySelector('input');
+    input.focus();
+    const dot = old.lastIndexOf('.');
+    input.setSelectionRange(0, !isDirItem(el) && dot > 0 ? dot : old.length);
+  }
+
+  /** Met à jour onglets, dossiers dépliés et sélection quand des chemins changent [[ancien, nouveau], …]. */
+  function remap(pairs) {
+    const map = (p) => {
+      for (const [a, b] of pairs) { if (p === a) return b; if (p.startsWith(a + '/')) return b + p.slice(a.length); }
+      return p;
+    };
+    for (const d of docs) {
+      if (!d.path) continue;
+      const n = map(d.path);
+      if (n !== d.path) { d.path = n; d.name = baseName(n); }
+    }
+    const dirs = [...openDirs];
+    openDirs.clear();
+    dirs.forEach(p => openDirs.add(map(p)));
+    store.set('openDirs', [...openDirs]);
+    renderTabs(); saveSessionSoon();
+  }
+
+  // ---------------------------------------------------------------- supprimer / copier / couper / coller
+
+  async function deleteSel() {
+    const paths = [...sel];
+    if (!paths.length) return;
+    const hasDir = paths.some(p => isDirItem(itemOf(p)));
+    const msg = paths.length === 1
+      ? 'Voulez-vous vraiment supprimer « ' + baseName(paths[0]) + ' » ?' + (hasDir ? '\n\nSon contenu sera supprimé aussi.' : '')
+      : 'Voulez-vous vraiment supprimer les ' + paths.length + ' éléments sélectionnés ?';
+    if (!confirm(msg + '\n\nIls seront déplacés dans le dossier caché « .corbeille » (récupérables).')) return;
+    try {
+      await postJson('/api/supprimer', { chemins: paths });
+      for (const d of [...docs]) {
+        if (!d.path || !paths.some(p => d.path === p || d.path.startsWith(p + '/'))) continue;
+        if (isDirty(d)) d.path = null; else closeDoc(d);
+      }
+      select([]); anchor = null;
+      renderTabs(); saveSessionSoon();
+      consoleSys('✔ Supprimé (corbeille) : ' + paths.map(baseName).join(', '));
+      await loadTree();
+    } catch (e) { alert('Suppression impossible : ' + e.message); }
+  }
+
+  function copySel() { clip = { paths: [...sel], cut: false }; paint(); }
+  function cutSel() { clip = { paths: [...sel], cut: true }; paint(); }
+  async function paste() {
+    if (!clip.paths.length) return;
+    const { paths, cut } = clip;
+    if (cut) clip = { paths: [], cut: false };
+    await transfer(paths, targetDir(), !cut, false);
+  }
+
+  /** Déplace (ou copie) des éléments vers un dossier ; `ask` = demander confirmation avant un déplacement. */
+  async function transfer(paths, dir, copy, ask) {
+    paths = paths.filter(p => copy || dirOf(p) !== dir);
+    if (!paths.length) return;
+    if (!copy && ask) {
+      const dest = dir ? '« ' + dir + ' »' : '« ' + server.rootName + ' »';
+      const msg = paths.length === 1
+        ? 'Voulez-vous vraiment déplacer « ' + baseName(paths[0]) + ' » dans ' + dest + ' ?'
+        : 'Voulez-vous vraiment déplacer les ' + paths.length + ' éléments sélectionnés dans ' + dest + ' ?';
+      if (!confirm(msg)) return;
+    }
+    try {
+      const r = await (await postJson('/api/deplacer', { sources: paths, dossier: dir, copier: copy })).json();
+      if (!copy) remap(paths.map((p, i) => [p, r.chemins[i]]));
+      if (dir) { openAncestors(dir + '/x'); }
+      consoleSys('✔ ' + (copy ? 'Copié' : 'Déplacé') + ' : ' + r.chemins.join(', '));
+      await loadTree();
+      select(r.chemins); anchor = r.chemins[0];
+    } catch (e) { alert((copy ? 'Copie' : 'Déplacement') + ' impossible : ' + e.message); }
+  }
+
+  function copyText(text) {
+    const fallback = () => {
+      const t = document.createElement('textarea');
+      t.value = text; t.style.position = 'fixed'; t.style.opacity = '0';
+      document.body.appendChild(t); t.select();
+      try { document.execCommand('copy'); } catch (e) { /* pas de presse-papiers */ }
+      t.remove();
+    };
+    if (navigator.clipboard && window.isSecureContext) navigator.clipboard.writeText(text).catch(fallback);
+    else fallback();
+  }
+
+  function copyPath(relative) {
+    const p = [...sel][0];
+    if (p) copyText(relative ? p : (server.rootPath || '') + '/' + p);
+  }
+
+  // ---------------------------------------------------------------- glisser-déposer
+
+  let dragPaths = [];
+  let hoverDir = null, hoverTimer = null;
+
+  function clearDrop() {
+    treeEl.querySelectorAll('.drop-target').forEach(el => el.classList.remove('drop-target'));
+    treeEl.classList.remove('drop-root');
+    clearTimeout(hoverTimer); hoverDir = null;
+  }
+
+  function dropTargetOf(e) {
+    const el = e.target.closest('.tree-item');
+    if (!el) return { dir: '', el: null };
+    return isDirItem(el) ? { dir: el.dataset.path, el } : { dir: dirOf(el.dataset.path), el: null };
+  }
+
+  treeEl.addEventListener('dragstart', (e) => {
+    const el = e.target.closest('.tree-item');
+    if (!el) return;
+    const p = el.dataset.path;
+    if (!sel.has(p)) { select([p]); anchor = p; }
+    dragPaths = [...sel];
+    e.dataTransfer.setData('text/plain', dragPaths.join('\n'));
+    e.dataTransfer.effectAllowed = 'copyMove';
+  });
+  treeEl.addEventListener('dragend', () => { dragPaths = []; clearDrop(); });
+
+  treeEl.addEventListener('dragover', (e) => {
+    if (!dragPaths.length) return;
+    const t = dropTargetOf(e);
+    const invalid = dragPaths.some(s => isDirItem(itemOf(s)) && (t.dir === s || t.dir.startsWith(s + '/')));
+    if (invalid) { e.dataTransfer.dropEffect = 'none'; clearDrop(); return; }
+    e.preventDefault();
+    e.dataTransfer.dropEffect = (e.ctrlKey || e.altKey) ? 'copy' : 'move';
+    treeEl.querySelectorAll('.drop-target').forEach(el => el.classList.remove('drop-target'));
+    treeEl.classList.remove('drop-root');
+    if (t.el) t.el.classList.add('drop-target'); else if (!t.dir) treeEl.classList.add('drop-root');
+    // un dossier replié s'ouvre quand on reste dessus (comme VS Code)
+    if (t.el && !openDirs.has(t.dir) && hoverDir !== t.dir) {
+      clearTimeout(hoverTimer); hoverDir = t.dir;
+      hoverTimer = setTimeout(() => setOpen(t.dir, true), 700);
+    } else if (!t.el || openDirs.has(t.dir)) { clearTimeout(hoverTimer); hoverDir = null; }
+  });
+  treeEl.addEventListener('dragleave', (e) => { if (!treeEl.contains(e.relatedTarget)) clearDrop(); });
+
+  treeEl.addEventListener('drop', (e) => {
+    if (!dragPaths.length) return;
+    e.preventDefault();
+    const t = dropTargetOf(e);
+    const paths = dragPaths;
+    clearDrop();
+    dragPaths = [];
+    transfer(paths, t.dir, e.ctrlKey || e.altKey, true);
+  });
+
+  // ---------------------------------------------------------------- clavier
+
+  treeEl.addEventListener('keydown', async (e) => {
+    if (e.target.closest('.tree-input')) return;
+    const ctrl = e.ctrlKey || e.metaKey;
+    const vis = visibleItems();
+    const idx = vis.findIndex(el => el.dataset.path === cursor);
+    const go = (i) => {
+      if (!vis.length) return;
+      i = Math.max(0, Math.min(vis.length - 1, i));
+      const p = vis[i].dataset.path;
+      if (e.shiftKey) selectRange(p); else { select([p]); anchor = p; }
+      vis[i].scrollIntoView({ block: 'nearest' });
+    };
+    const cur = idx >= 0 ? vis[idx] : null;
+    const key = e.key.toLowerCase();
+    if (ctrl && key === 'c') { e.preventDefault(); copySel(); return; }
+    if (ctrl && key === 'x') { e.preventDefault(); cutSel(); return; }
+    if (ctrl && key === 'v') { e.preventDefault(); paste(); return; }
+    if (ctrl && key === 'a') { e.preventDefault(); select(vis.map(el => el.dataset.path), cursor); return; }
+    switch (e.key) {
+      case 'ArrowDown': e.preventDefault(); go(idx + 1); break;
+      case 'ArrowUp': e.preventDefault(); go(idx < 0 ? 0 : idx - 1); break;
+      case 'Home': e.preventDefault(); go(0); break;
+      case 'End': e.preventDefault(); go(vis.length - 1); break;
+      case 'ArrowRight':
+        e.preventDefault();
+        if (isDirItem(cur)) { if (!openDirs.has(cursor)) setOpen(cursor, true); else go(idx + 1); }
+        break;
+      case 'ArrowLeft':
+        e.preventDefault();
+        if (isDirItem(cur) && openDirs.has(cursor)) setOpen(cursor, false);
+        else if (cur && dirOf(cursor)) { const par = itemOf(dirOf(cursor)); if (par) { select([par.dataset.path]); anchor = par.dataset.path; par.scrollIntoView({ block: 'nearest' }); } }
+        break;
+      case 'Enter':
+        e.preventDefault();
+        if (isDirItem(cur)) setOpen(cursor, !openDirs.has(cursor));
+        else if (cur) { await openFromTree(cursor); ta.focus(); }
+        break;
+      case 'F2': e.preventDefault(); startRename(); break;
+      case 'Delete': e.preventDefault(); deleteSel(); break;
+      case 'Escape': select([]); anchor = null; break;
+      default: break;
+    }
+  });
+
+  function collapseAll() {
+    openDirs.clear();
+    store.set('openDirs', []);
+    allItems().filter(isDirItem).forEach(el => {
+      el.querySelector('.ic').textContent = '▸';
+      el.nextElementSibling.classList.add('closed');
+    });
+  }
+
+  // ---------------------------------------------------------------- ouvrir un dossier de travail (« Ouvrir le dossier » de VS Code)
+
+  async function chooseFolder() {
+    if (!server.ok) { alert('Il faut lancer le serveur (serveur.py) pour choisir un dossier.'); return; }
+    const overlay = document.createElement('div');
+    overlay.className = 'fp-overlay';
+    overlay.innerHTML = '<div class="fp-box"><div class="fp-title">Ouvrir un dossier de travail</div>' +
+      '<div class="fp-path"></div><div class="fp-list"></div>' +
+      '<div class="fp-actions"><button class="fp-cancel">Annuler</button>' +
+      '<button class="fp-ok primary">Ouvrir ce dossier</button></div></div>';
+    document.body.appendChild(overlay);
+    const close = () => { overlay.remove(); document.removeEventListener('keydown', onKey, true); };
+    const onKey = (e) => { if (e.key === 'Escape') { e.stopPropagation(); close(); } };
+    document.addEventListener('keydown', onKey, true);
+    overlay.addEventListener('mousedown', (e) => { if (e.target === overlay) close(); });
+    overlay.querySelector('.fp-cancel').onclick = close;
+
+    let current = '';
+    const list = overlay.querySelector('.fp-list');
+    async function show(rel) {
+      try {
+        const d = await (await api('/api/dossiers?chemin=' + encodeURIComponent(rel))).json();
+        current = d.chemin;
+        overlay.querySelector('.fp-path').textContent = '/' + (d.chemin || '');
+        list.innerHTML = '';
+        const add = (label, target) => {
+          const row = document.createElement('div');
+          row.className = 'fp-item';
+          row.textContent = label;
+          row.onclick = () => show(target);
+          list.appendChild(row);
+        };
+        if (d.parent != null) add('⬑  ..', d.parent);
+        for (const f of d.dossiers) add('📁 ' + f.nom, f.chemin);
+        if (!d.dossiers.length && d.parent == null) list.innerHTML = '<div class="fp-empty">Aucun sous-dossier.</div>';
+      } catch (e) { list.innerHTML = '<div class="fp-empty">Erreur : ' + esc(e.message) + '</div>'; }
+    }
+    overlay.querySelector('.fp-ok').onclick = async () => {
+      try {
+        const info = await (await postJson('/api/racine', { chemin: current })).json();
+        close();
+        switchRoot(info);
+      } catch (e) { alert('Impossible d\'ouvrir ce dossier : ' + e.message); }
+    };
+    show((await (await api('/api/info')).json()).courant);
+  }
+
+  function switchRoot(info) {
+    server.rootName = info.nom;
+    server.rootPath = info.racine;
+    store.set('racine', info.courant);
+    // les chemins des onglets étaient relatifs à l'ancien dossier : on ferme les onglets
+    // enregistrés ; ceux qui ont des modifications restent, comme « pas encore enregistrés »
+    for (const d of [...docs]) {
+      if (!d.path) continue;
+      if (isDirty(d)) { d.path = null; } else { docs.splice(docs.indexOf(d), 1); }
+    }
+    if (!docs.length) newDoc({ name: 'bienvenue.txt', content: WELCOME, saved: WELCOME });
+    if (!docs.some(d => d.id === activeId)) switchTo(docs[0]);
+    openDirs.clear(); store.set('openDirs', []);
+    sel.clear(); cursor = ''; anchor = null; clip = { paths: [], cut: false };
+    saveSession(); renderTabs();
+    loadTree();
   }
 
   // ================================================================ coloration syntaxique
@@ -1334,6 +1865,10 @@ NON (C1 OU C2)  ⇔  NON C1 ET NON C2</pre>
     $('#btn-theme').onclick = () => { prefs.theme = prefs.theme === 'dark' ? 'light' : 'dark'; applyPrefs(); savePrefs(); };
 
     await detectServer();
+    $('#btn-folder').onclick = chooseFolder;
+    $('#btn-newfile').onclick = () => startCreate('file');
+    $('#btn-newdir').onclick = () => startCreate('dir');
+    $('#btn-collapse').onclick = collapseAll;
     $('#btn-open').title = server.ok ? 'Ouvrir un fichier depuis n\'importe où sur le disque (Ctrl+O). Les fichiers du cours sont dans le panneau de gauche.' : 'Ouvrir un fichier (Ctrl+O)';
 
     const sess = store.get('session', null);
